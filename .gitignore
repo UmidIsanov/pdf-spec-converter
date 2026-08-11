@@ -23,5 +23,9 @@ frontend/.vite/
 # Input data (large PDFs)
 input_pdfs/
 
+# Runtime (сервер)
+logs/
+*.pid
+
 # OS junk
 .DS_Store
