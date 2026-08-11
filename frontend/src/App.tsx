@@ -14,7 +14,7 @@ import {
   Search,
   Calculator,
 } from 'lucide-react'
-import { convertFiles, exportToExcel, checkHealth } from './api'
+import { convertOneFile, exportToExcel, checkHealth } from './api'
 import { ITEM_COLUMNS, type FileResult } from './types'
 
 type Status = 'idle' | 'loading' | 'done'
@@ -63,8 +63,8 @@ export default function App() {
     const acc: FileResult[] = []
     try {
       for (const f of files) {
-        const res = await convertFiles([f])
-        acc.push(...res.results)
+        const result = await convertOneFile(f)
+        acc.push(result)
         setProgress({ done: acc.length, total: files.length })
       }
       setResults(acc)
@@ -263,6 +263,7 @@ export default function App() {
             </div>
 
             <SearchSum results={results} />
+            <TotalByName results={results} />
 
             {results.map((r) => (
               <FileResultCard key={r.filename} result={r} />
@@ -502,6 +503,107 @@ function SearchSum({ results }: { results: FileResult[] }) {
               </div>
             </>
           )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function TotalByName({ results }: { results: FileResult[] }) {
+  const [open, setOpen] = useState(false)
+
+  // Сводка: сумма количества по каждому наименованию (по всем файлам)
+  const rows = useMemo(() => {
+    const groups = new Map<
+      string,
+      { name: string; code: string; unit: string; qty: number; objects: Set<string> }
+    >()
+    const norm = (s: string) => s.trim().replace(/\s+/g, ' ').toLowerCase()
+    for (const r of results) {
+      if (r.error) continue
+      for (const it of r.items) {
+        const name = (it.name || '').trim()
+        if (!name) continue
+        const unit = (it.unit || '').trim()
+        const code = (it.product_code || it.type_code || '').trim()
+        // группируем по коду (если есть), иначе по имени — один товар = одна строка
+        const key = `${code ? 'c:' + norm(code) : 'n:' + norm(name)}|${norm(unit)}`
+        let g = groups.get(key)
+        if (!g) {
+          g = { name, code: it.product_code || it.type_code || '', unit, qty: 0, objects: new Set() }
+          groups.set(key, g)
+        }
+        if (typeof it.quantity === 'number') g.qty += it.quantity
+        if (name.length > g.name.length) g.name = name // самое подробное имя
+        if (!g.code) g.code = it.product_code || it.type_code || ''
+        g.objects.add(r.doc_number || r.filename)
+      }
+    }
+    return Array.from(groups.values()).sort((a, b) =>
+      a.name.toLowerCase().localeCompare(b.name.toLowerCase()),
+    )
+  }, [results])
+
+  return (
+    <div className="bg-white rounded-3xl border border-slate-200 overflow-hidden">
+      <button
+        onClick={() => setOpen((o) => !o)}
+        className="w-full p-5 flex items-center gap-3 text-left"
+      >
+        <div className="w-10 h-10 rounded-2xl bg-green-100 text-green-600 flex items-center justify-center shrink-0">
+          <Calculator size={20} />
+        </div>
+        <div className="flex-1">
+          <p className="font-black text-slate-800 leading-none">
+            Итого по наименованиям
+          </p>
+          <p className="text-xs text-slate-500 font-medium mt-1">
+            Суммарное количество по каждому наименованию во всех спецификациях ·{' '}
+            {rows.length} позиций
+          </p>
+        </div>
+        <ChevronDown
+          size={20}
+          className={`text-slate-300 transition-transform ${open ? 'rotate-180' : ''}`}
+        />
+      </button>
+
+      {open && (
+        <div className="overflow-x-auto border-t border-slate-100">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="bg-slate-50 text-slate-500">
+                <th className="text-left font-black uppercase tracking-wider text-[10px] px-4 py-3">
+                  Наименование
+                </th>
+                <th className="text-left font-black uppercase tracking-wider text-[10px] px-4 py-3 whitespace-nowrap">
+                  Тип / код
+                </th>
+                <th className="text-right font-black uppercase tracking-wider text-[10px] px-4 py-3 whitespace-nowrap">
+                  Итого
+                </th>
+                <th className="text-right font-black uppercase tracking-wider text-[10px] px-4 py-3 whitespace-nowrap">
+                  Объектов
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((g, i) => (
+                <tr key={i} className="border-t border-slate-50 align-top hover:bg-slate-50/60">
+                  <td className="px-4 py-3 font-medium text-slate-700 min-w-[260px]">
+                    {g.name}
+                  </td>
+                  <td className="px-4 py-3 text-slate-600 whitespace-nowrap">
+                    {g.code || '—'}
+                  </td>
+                  <td className="px-4 py-3 font-black text-slate-900 text-right whitespace-nowrap">
+                    {g.qty} {g.unit}
+                  </td>
+                  <td className="px-4 py-3 text-slate-500 text-right">{g.objects.size}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
       )}
     </div>

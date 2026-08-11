@@ -12,6 +12,8 @@ FastAPI-бэкенд конвертера спецификаций.
 import io
 import os
 import sys
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional
 
 from fastapi import FastAPI, UploadFile, File
@@ -66,6 +68,7 @@ class SpecItem(BaseModel):
 class FileResult(BaseModel):
     filename: str
     doc_number: str = ""
+    object_name: str = ""
     system_name: str = ""
     items: List[SpecItem] = []
     error: Optional[str] = None
@@ -85,42 +88,69 @@ def health():
         return {"ok": True, "key_configured": False, "detail": str(e)}
 
 
+# --- Фоновая обработка задач (обход таймаута Cloudflare ~100 сек) ---
+# Один PDF = одна задача. /api/convert мгновенно возвращает job_id и запускает
+# разбор в фоновом потоке; фронтенд опрашивает /api/job/{id} каждые 2 сек.
+# Так каждый HTTP-запрос короткий, а Gemini работает сколько нужно.
+_jobs: dict = {}
+_executor = ThreadPoolExecutor(max_workers=4)
+
+
+def _process_file_job(job_id: str, filename: str, raw: bytes):
+    entry = {
+        "filename": filename,
+        "doc_number": "",
+        "object_name": "",
+        "system_name": "",
+        "items": [],
+        "error": None,
+    }
+    try:
+        text = extract_text_from_pdf(io.BytesIO(raw))
+        if not text.strip():
+            entry["error"] = "Не удалось извлечь текст (возможно, это скан-картинка)."
+            _jobs[job_id] = {"status": "done", "result": entry}
+            return
+        parsed = parse_specification_with_ai(text, client=get_client())
+        entry["doc_number"] = parsed.get("doc_number", "")
+        entry["object_name"] = parsed.get("object_name", "")
+        entry["system_name"] = parsed.get("system_name", "")
+        entry["items"] = parsed.get("items", [])
+        _jobs[job_id] = {"status": "done", "result": entry}
+    except Exception as e:  # noqa: BLE001
+        entry["error"] = str(e)
+        _jobs[job_id] = {"status": "done", "result": entry}
+
+
 @app.post("/api/convert")
 async def convert(files: List[UploadFile] = File(...)):
-    """Принимает один или несколько PDF, возвращает разобранные позиции по каждому."""
+    """Запускает фоновый разбор одного PDF, возвращает job_id (мгновенно)."""
     try:
-        client = get_client()
+        get_api_key()
     except RuntimeError as e:
         return JSONResponse(status_code=500, content={"detail": str(e)})
 
-    results = []
-    for upload in files:
-        entry = {
-            "filename": upload.filename,
-            "doc_number": "",
-            "system_name": "",
-            "items": [],
-            "error": None,
-        }
-        try:
-            raw = await upload.read()
-            text = extract_text_from_pdf(io.BytesIO(raw))
+    if not files:
+        return JSONResponse(status_code=400, content={"detail": "Нет файла."})
 
-            if not text.strip():
-                entry["error"] = "Не удалось извлечь текст (возможно, это скан-картинка)."
-                results.append(entry)
-                continue
+    upload = files[0]  # фронтенд шлёт по одному файлу за запрос
+    raw = await upload.read()
+    job_id = uuid.uuid4().hex
+    _jobs[job_id] = {"status": "pending"}
+    _executor.submit(_process_file_job, job_id, upload.filename, raw)
+    return {"job_id": job_id}
 
-            parsed = parse_specification_with_ai(text, client=client)
-            entry["doc_number"] = parsed.get("doc_number", "")
-            entry["system_name"] = parsed.get("system_name", "")
-            entry["items"] = parsed.get("items", [])
-        except Exception as e:  # noqa: BLE001
-            entry["error"] = str(e)
 
-        results.append(entry)
-
-    return {"results": results}
+@app.get("/api/job/{job_id}")
+def job_status(job_id: str):
+    """Статус фоновой задачи: pending | done (+result)."""
+    job = _jobs.get(job_id)
+    if job is None:
+        return JSONResponse(status_code=404, content={"detail": "Задача не найдена."})
+    if job.get("status") == "done":
+        # отдаём результат и подчищаем, чтобы память не росла
+        _jobs.pop(job_id, None)
+    return job
 
 
 @app.post("/api/export")
@@ -133,6 +163,7 @@ def export(req: ExportRequest):
         file_results.append({
             "filename": r.filename,
             "doc_number": r.doc_number,
+            "object_name": r.object_name,
             "system_name": r.system_name,
             "items": [item.model_dump() for item in r.items],
         })

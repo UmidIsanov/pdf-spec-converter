@@ -16,6 +16,7 @@ export interface SpecItem {
 export interface FileResult {
   filename: string
   doc_number: string
+  object_name: string
   system_name: string
   items: SpecItem[]
   error: string | null
@@ -28,13 +29,12 @@ export interface ConvertResponse {
 // Колонки таблицы: ключ в SpecItem + подпись
 export const ITEM_COLUMNS: { key: keyof SpecItem; label: string }[] = [
   { key: 'section', label: 'Раздел' },
-  { key: 'pos', label: 'Поз.' },
+  { key: 'pos', label: 'Позиция в спецификации' },
   { key: 'name', label: 'Наименование и тех. характеристика' },
   { key: 'type_code', label: 'Тип, марка' },
   { key: 'product_code', label: 'Код продукции' },
   { key: 'supplier', label: 'Поставщик' },
   { key: 'unit', label: 'Ед. изм.' },
   { key: 'quantity', label: 'Кол-во' },
-  { key: 'weight_kg', label: 'Масса, кг' },
   { key: 'note', label: 'Примечание' },
 ]

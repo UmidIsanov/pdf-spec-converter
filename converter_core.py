@@ -38,19 +38,18 @@ MIN_COLUMN_WIDTH = 10
 # Порядок и подписи колонок итоговой таблицы: (заголовок в Excel, ключ в JSON от ИИ)
 ITEM_COLUMNS = [
     ("Раздел", "section"),
-    ("Поз.", "pos"),
+    ("Позиция в спецификации", "pos"),
     ("Наименование и техническая характеристика", "name"),
     ("Тип, марка, обозначение", "type_code"),
     ("Код продукции", "product_code"),
     ("Поставщик", "supplier"),
     ("Ед. изм.", "unit"),
     ("Кол-во", "quantity"),
-    ("Масса 1 ед, кг", "weight_kg"),
     ("Примечание", "note"),
 ]
 
 # Колонки уровня документа (идут перед позиционными)
-DOC_COLUMNS = ["Имя файла", "Шифр документа", "Система"]
+DOC_COLUMNS = ["Объект", "Шифр документа", "Система"]
 
 
 def all_headers():
@@ -62,6 +61,7 @@ SPEC_SCHEMA = {
     "type": "OBJECT",
     "properties": {
         "doc_number": {"type": "STRING", "description": "Шифр/номер документа из штампа"},
+        "object_name": {"type": "STRING", "description": "Наименование объекта/сооружения из штампа (например 'Склад крупнодробленой руды'), без названия системы и без стадии"},
         "system_name": {"type": "STRING", "description": "Наименование системы/раздела"},
         "items": {
             "type": "ARRAY",
@@ -101,6 +101,8 @@ SYSTEM_PROMPT = """
   не склеивай слова вместе (например «Пожарной Автоматики», а не «ПожарнойАвтоматики»).
 - Поле "weight_kg" (масса) заполняй только если масса реально указана в тексте; если её нет —
   не ставь 0, оставь поле пустым (не указывай).
+- В поле "object_name" укажи наименование объекта/сооружения из штампа (то, ГДЕ монтируется
+  система), например «Склад крупнодробленой руды» — без названия системы и без стадии.
 """
 
 
@@ -166,21 +168,42 @@ def parse_specification_with_ai(text_content, client=None, max_retries=5):
             time.sleep(2 ** attempt)  # 2, 4, 8, 16 секунд
 
 
-def items_to_rows(filename, doc_number, system_name, items):
-    """Превращает список позиций (items) в список плоских строк для DataFrame."""
+def full_shifr(filename):
+    """Полный шифр документа = имя файла без расширения (в нём есть и суффикс ревизии, напр. 'C2')."""
+    return os.path.splitext(filename or "")[0].strip()
+
+
+def system_code(shifr):
+    """Аббревиатура системы из шифра: ПОСЛЕДНИЙ сегмент из 2-5 заглавных букв перед числом.
+    Напр. 'MOF3-UN-300000-INS-AFS-0021' → 'AFS' (а не 'UN')."""
+    codes = re.findall(r'([A-Z]{2,5})-\d', shifr or "")
+    return codes[-1] if codes else ""
+
+
+def items_to_rows(res):
+    """Превращает результат разбора одного файла в плоские строки.
+
+    res — словарь: {"filename", "doc_number", "system_name", "object_name", "items"}
+    Колонки уровня документа:
+      Объект        — наименование объекта (object_name, иначе system_name)
+      Шифр документа — полный шифр из имени файла (с суффиксом ревизии)
+      Система        — аббревиатура (AFS и т.п.), извлечённая из шифра
+    """
+    filename = res.get("filename", "")
+    shifr = full_shifr(filename)
+    obj = (res.get("object_name") or res.get("system_name") or "").strip()
+    sys_code = system_code(shifr) or (res.get("system_name") or "")
+
     rows = []
-    for item in items:
+    for item in res.get("items", []):
         row = {
-            "Имя файла": filename,
-            "Шифр документа": doc_number,
-            "Система": system_name,
+            "Объект": obj,
+            "Шифр документа": shifr,
+            "Система": sys_code,
         }
         for header, key in ITEM_COLUMNS:
             value = item.get(key, "")
             if value is None:
-                value = ""
-            # Масса: не показываем 0 там, где массы нет — оставляем пусто
-            if key == "weight_kg" and value in (0, 0.0):
                 value = ""
             row[header] = value
         rows.append(row)
@@ -242,26 +265,87 @@ def _write_sheet(worksheet, headers, rows):
     worksheet.auto_filter.ref = worksheet.dimensions
 
 
+# Колонки итоговой сводки по наименованиям
+SUMMARY_COLUMNS = [
+    "Наименование и техническая характеристика",
+    "Тип, марка, обозначение",
+    "Код продукции",
+    "Ед. изм.",
+    "Итого количество",
+    "Кол-во объектов",
+]
+
+
+def _norm(s):
+    """Нормализует строку: нижний регистр, схлопнутые пробелы."""
+    return re.sub(r"\s+", " ", (s or "").strip().lower())
+
+
+def summarize_by_name(all_rows):
+    """Сводит позиции и суммирует количество по всем спецификациям.
+
+    Один и тот же товар в разных спецификациях часто назван по-разному, но код у него
+    один. Поэтому группируем по КОДУ (Код продукции, иначе Тип/марка), а если кода нет —
+    по нормализованному наименованию. Единицу измерения держим в ключе (не мешаем шт. и м).
+    """
+    groups = {}
+    for r in all_rows:
+        name = (r.get("Наименование и техническая характеристика") or "").strip()
+        if not name:
+            continue
+        unit = (r.get("Ед. изм.") or "").strip()
+        code = (r.get("Код продукции") or r.get("Тип, марка, обозначение") or "").strip()
+        # ключ: по коду, если он есть; иначе по имени
+        key = (("c:" + _norm(code)) if code else ("n:" + _norm(name)), _norm(unit))
+
+        g = groups.get(key)
+        if g is None:
+            g = {"name": name, "unit": unit, "qty": 0,
+                 "type_code": r.get("Тип, марка, обозначение") or "",
+                 "product_code": r.get("Код продукции") or "",
+                 "objects": set()}
+            groups[key] = g
+        qty = r.get("Кол-во")
+        if isinstance(qty, (int, float)):
+            g["qty"] += qty
+        # показываем самое длинное (обычно самое подробное) наименование
+        if len(name) > len(g["name"]):
+            g["name"] = name
+        if not g["type_code"]:
+            g["type_code"] = r.get("Тип, марка, обозначение") or ""
+        if not g["product_code"]:
+            g["product_code"] = r.get("Код продукции") or ""
+        g["objects"].add(r.get("Шифр документа") or "")
+
+    rows = []
+    for g in groups.values():
+        qty = g["qty"]
+        rows.append({
+            "Наименование и техническая характеристика": g["name"],
+            "Тип, марка, обозначение": g["type_code"],
+            "Код продукции": g["product_code"],
+            "Ед. изм.": g["unit"],
+            "Итого количество": int(qty) if float(qty).is_integer() else qty,
+            "Кол-во объектов": len(g["objects"]),
+        })
+    rows.sort(key=lambda x: x["Наименование и техническая характеристика"].lower())
+    return rows
+
+
 def build_workbook(file_results, output=None):
     """Собирает Excel-книгу из результатов разбора (на openpyxl, без pandas).
 
     file_results — список словарей:
-        {"filename": str, "doc_number": str, "system_name": str, "items": [ {...}, ... ]}
+        {"filename", "doc_number", "system_name", "object_name", "items": [...]}
 
     output — путь к файлу (str) или None. Если None — вернёт BytesIO с готовой книгой.
-    Возвращает путь (str) при записи в файл, иначе BytesIO.
     """
     headers = all_headers()
     all_rows = []
     per_file = []  # (filename, rows)
 
     for res in file_results:
-        rows = items_to_rows(
-            res.get("filename", ""),
-            res.get("doc_number", ""),
-            res.get("system_name", ""),
-            res.get("items", []),
-        )
+        rows = items_to_rows(res)
         if rows:
             all_rows.extend(rows)
             per_file.append((res.get("filename", "лист"), rows))
@@ -271,14 +355,19 @@ def build_workbook(file_results, output=None):
 
     wb = Workbook()
 
-    # Сводный лист
+    # 1) Лист «Итого по наименованиям» — сумма количеств по всем спецификациям
+    summary_by_name_name = "Итого по наименованиям"
+    ws_total = wb.active
+    ws_total.title = summary_by_name_name
+    _write_sheet(ws_total, SUMMARY_COLUMNS, summarize_by_name(all_rows))
+
+    # 2) Сводный лист со всеми позициями
     summary_sheet_name = "Сводная спецификация"
-    ws_summary = wb.active
-    ws_summary.title = summary_sheet_name
+    ws_summary = wb.create_sheet(title=summary_sheet_name)
     _write_sheet(ws_summary, headers, all_rows)
 
-    # Лист на каждый файл
-    used_names = {summary_sheet_name}
+    # 3) Лист на каждый файл
+    used_names = {summary_by_name_name, summary_sheet_name}
     for filename, rows in per_file:
         sheet_name = safe_sheet_name(filename, used_names)
         ws = wb.create_sheet(title=sheet_name)
